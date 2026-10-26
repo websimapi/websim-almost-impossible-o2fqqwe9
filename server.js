@@ -1,7 +1,7 @@
 // ============================================================
 // Shared game rules — imported by the page as well (deterministic sim)
 // ============================================================
-export const TILE_CHARS = ".#_-^v<>oudG%";
+export const TILE_CHARS = ".#_-^v<>oudG%c";
 export const HB = 0.38;   // player half-box (tiles)
 export const PR = 0.44;   // player draw radius
 export const MAXV = 30;   // terminal velocity
@@ -13,7 +13,8 @@ const num = (v, a, b, d) => (Number.isFinite(+v) && v !== null && v !== "" ? cla
 const int = (v, a, b, d) => Math.round(num(v, a, b, d));
 const color = (v, d) => (typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v) ? v : d);
 
-export const DEFAULT_SETTINGS = { speed: 8, jump: 2.4, gravity: 70, autorun: false, bg: "#3b2a8c", clock: "world" };
+export const DEFAULT_SETTINGS = { view: "side", speed: 8, jump: 2.4, gravity: 70, autorun: false, bg: "#3b2a8c", clock: "world" };
+export const TOP_SPEED = 4; // default move speed for new top-down levels
 
 export function normalizeLevel(d) {
   d = d && typeof d === "object" ? d : {};
@@ -21,11 +22,12 @@ export function normalizeLevel(d) {
   const rows = [];
   const src = Array.isArray(d.rows) ? d.rows : [];
   for (let y = 0; y < h; y++) {
-    const r = String(src[y] ?? "").replace(/[^.#_\-^v<>oudG%]/g, ".");
+    const r = String(src[y] ?? "").replace(/[^.#_\-^v<>oudG%c]/g, ".");
     rows.push(r.padEnd(w, ".").slice(0, w));
   }
   const s = d.settings || {};
   const settings = {
+    view: s.view === "top" ? "top" : "side",
     speed: num(s.speed, 1, 40, DEFAULT_SETTINGS.speed),
     jump: num(s.jump, 0.5, 12, DEFAULT_SETTINGS.jump),
     gravity: num(s.gravity, 5, 300, DEFAULT_SETTINGS.gravity),
@@ -38,9 +40,10 @@ export function normalizeLevel(d) {
   const enemies = (Array.isArray(d.enemies) ? d.enemies : []).slice(0, 400).map((e) => ({
     x1: num(e.x1, -5, w + 5, 0), y1: num(e.y1, -5, h + 5, 0),
     x2: num(e.x2, -5, w + 5, 0), y2: num(e.y2, -5, h + 5, 0),
-    speed: num(e.speed, 0, 40, 3), wait: num(e.wait, 0, 30, 0.5),
+    speed: num(e.speed, -40, 40, 3), wait: num(e.wait, 0, 30, 0.5),
     size: num(e.size, 0.15, 4, 0.45), phase: num(e.phase, -1000, 1000, 0),
-    kind: e.kind === "block" ? "block" : "saw",
+    kind: e.kind === "block" || e.kind === "dot" ? e.kind : "saw",
+    path: e.path === "circle" ? "circle" : "line",
   }));
   const colors = (Array.isArray(d.colors) ? d.colors : []).slice(0, 400)
     .map((c) => ({ x: num(c.x, 0, w, 0), color: color(c.color, "#000000") }))
@@ -88,8 +91,14 @@ function circleTri(px, py, r, T) {
 
 export function enemyPos(e, t) {
   const dx = e.x2 - e.x1, dy = e.y2 - e.y1, L = Math.hypot(dx, dy);
-  if (L < 1e-6 || e.speed <= 0) return { x: e.x1, y: e.y1 };
-  const mt = L / e.speed, cyc = 2 * (mt + e.wait);
+  if (L < 1e-6 || !e.speed) return { x: e.x1, y: e.y1 };
+  if (e.path === "circle") {
+    // orbit around (x1,y1) through (x2,y2); speed = tiles/s along the circle (negative = reverse)
+    const a = Math.atan2(dy, dx) + (e.speed / L) * (t + e.phase);
+    return { x: e.x1 + Math.cos(a) * L, y: e.y1 + Math.sin(a) * L };
+  }
+  const sp = Math.abs(e.speed);
+  const mt = L / sp, cyc = 2 * (mt + e.wait);
   const u = (((t + e.phase) % cyc) + cyc) % cyc;
   let f;
   if (u < e.wait) f = 0;
@@ -119,15 +128,72 @@ export function hazardAt(lv, x, y, r, et, enemyScale = 1) {
 }
 
 export function makePlayer(lv) {
-  return { x: lv.spawn.x + 0.5, y: lv.spawn.y + 1 - HB, vx: 0, vy: 0, g: 1, ground: false, coyote: 0, buf: 0 };
+  const top = lv.settings.view === "top";
+  return { x: lv.spawn.x + 0.5, y: top ? lv.spawn.y + 0.5 : lv.spawn.y + 1 - HB, vx: 0, vy: 0, g: 1, ground: false, coyote: 0, buf: 0, coins: new Set() };
 }
 
-function collideX(p, lv) {
+// Coin cells of a level: [{x, y, k}] (cached per level object)
+const coinCache = new WeakMap();
+export function coinList(lv) {
+  let c = coinCache.get(lv);
+  if (!c) {
+    c = [];
+    for (let y = 0; y < lv.h; y++) for (let x = 0; x < lv.w; x++) if (lv.rows[y][x] === "c") c.push({ x: x + 0.5, y: y + 0.5, k: x + "," + y });
+    coinCache.set(lv, c);
+  }
+  return c;
+}
+
+// Coins, goal and hazards — shared by both views.
+function contacts(p, lv, et) {
+  for (const c of coinList(lv)) {
+    if (!p.coins.has(c.k) && Math.abs(p.x - c.x) < 0.3 + HB && Math.abs(p.y - c.y) < 0.3 + HB) { p.coins.add(c.k); p.gotCoin = true; }
+  }
+  if (hazardAt(lv, p.x, p.y, CLIENT_HAZ_R, et)) return "dead";
+  if (p.coins.size >= coinList(lv).length) {
+    const cx = Math.floor(p.x), cy = Math.floor(p.y);
+    for (let y = cy - 1; y <= cy + 1; y++) for (let x = cx - 1; x <= cx + 1; x++)
+      if (tileAt(lv, x, y) === "G" && Math.abs(p.x - (x + 0.5)) < 0.5 + HB * 0.5 && Math.abs(p.y - (y + 0.5)) < 0.5 + HB * 0.5) return "goal";
+  }
+  return null;
+}
+
+function collideYTop(p, lv) {
+  for (let cy = Math.floor(p.y - HB); cy <= Math.floor(p.y + HB - 1e-6); cy++)
+    for (let cx = Math.floor(p.x - HB + 1e-4); cx <= Math.floor(p.x + HB - 1e-4); cx++) {
+      const R = solidRect(tileAt(lv, cx, cy), cx, cy);
+      if (!R) continue;
+      if (p.x + HB <= R[0] + 1e-4 || p.x - HB >= R[2] - 1e-4) continue;
+      if (p.y + HB <= R[1] || p.y - HB >= R[3]) continue;
+      p.y = p.y < (R[1] + R[3]) / 2 ? R[1] - HB : R[3] + HB;
+      p.vy = 0;
+    }
+}
+
+// Top-down step: free 4-way movement, no gravity.
+export function stepTop(p, inp, dt, lv, et) {
+  const S = lv.settings;
+  let ix = clamp(inp.x || 0, -1, 1), iy = clamp(inp.y || 0, -1, 1);
+  const m = Math.hypot(ix, iy);
+  if (m > 1) { ix /= m; iy /= m; }
+  p.vx = ix * S.speed; p.vy = iy * S.speed;
+  p.x = clamp(p.x + p.vx * dt, HB, lv.w - HB);
+  collideX(p, lv, true);
+  p.y = clamp(p.y + p.vy * dt, HB, lv.h - HB);
+  collideYTop(p, lv);
+  return contacts(p, lv, et);
+}
+
+export function step(p, inp, dt, lv, et) {
+  return lv.settings.view === "top" ? stepTop(p, inp, dt, lv, et) : stepPlayer(p, inp, dt, lv, et);
+}
+
+function collideX(p, lv, top = false) {
   let hit = false;
   for (let cy = Math.floor(p.y - HB); cy <= Math.floor(p.y + HB - 1e-6); cy++)
     for (let cx = Math.floor(p.x - HB); cx <= Math.floor(p.x + HB - 1e-6); cx++) {
       const R = solidRect(tileAt(lv, cx, cy), cx, cy);
-      if (!R || R[4]) continue;
+      if (!R || (R[4] && !top)) continue;
       if (p.y + HB <= R[1] + 1e-4 || p.y - HB >= R[3] - 1e-4) continue;
       if (p.x + HB <= R[0] || p.x - HB >= R[2]) continue;
       if (p.x < (R[0] + R[2]) / 2) p.x = R[0] - HB; else p.x = R[2] + HB;
@@ -191,20 +257,20 @@ export function stepPlayer(p, inp, dt, lv, et) {
         }
       } else if (c === "u" || c === "d") {
         if (Math.abs(p.x - (cx + 0.5)) < 0.6 && Math.abs(p.y - (cy + 0.5)) < 0.8) p.g = c === "u" ? -1 : 1;
-      } else if (c === "G") {
-        if (Math.abs(p.x - (cx + 0.5)) < 0.5 + HB && Math.abs(p.y - (cy + 0.5)) < 0.5 + HB) return "goal";
       }
     }
-  if (hazardAt(lv, p.x, p.y, CLIENT_HAZ_R, et)) return "dead";
   if (p.y > lv.h + 2 || p.y < -3) return "dead";
-  return null;
+  return contacts(p, lv, et);
 }
 
-// Horizontal distance spawn -> nearest goal tile (for min finish time).
+// Straight-line distance spawn -> nearest goal tile (for min finish time).
 export function goalDistance(lv) {
   let best = Infinity;
   for (let y = 0; y < lv.h; y++) for (let x = 0; x < lv.w; x++)
-    if (lv.rows[y][x] === "G") best = Math.min(best, Math.max(0, Math.abs(x + 0.5 - (lv.spawn.x + 0.5)) - 1.5));
+    if (lv.rows[y][x] === "G") {
+      const dx = Math.abs(x - lv.spawn.x), dy = lv.settings.view === "top" ? Math.abs(y - lv.spawn.y) : 0;
+      best = Math.min(best, Math.max(0, Math.hypot(dx, dy) - 1.5));
+    }
   return best === Infinity ? 0 : best;
 }
 
@@ -374,6 +440,8 @@ async function getLevel(env, id) {
     at: Date.now(), lv,
     minMs: (goalDistance(lv) / (lv.settings.speed * 1.12)) * 1000,
     portals: lv.rows.some((r) => /[ud]/.test(r)),
+    top: lv.settings.view === "top",
+    coins: coinList(lv),
   };
   levelCache.set(id, entry);
   return entry;
@@ -401,10 +469,11 @@ function checkSample(me, x, y, t, now) {
   if (x < 0 || x > lv.w + 1 || y < -4 || y > lv.h + 4) return "bad";
   let bad = false;
   if (Math.abs(x - run.lx) > S.speed * 1.2 * dt + 0.6) bad = true;
-  if (Math.abs(y - run.ly) > MAXV * 1.1 * dt + 0.6) bad = true;
+  if (Math.abs(y - run.ly) > (run.top ? S.speed * 1.2 : MAXV * 1.1) * dt + 0.6) bad = true;
   const cx = Math.floor(x), cy = Math.floor(y);
   if (tileAt(lv, cx, cy) === "#" && x - cx > 0.15 && x - cx < 0.85 && y - cy > 0.15 && y - cy < 0.85) bad = true;
-  if (!run.portals) {
+  for (const c of run.coinsAll) if (Math.abs(x - c.x) < 1.05 && Math.abs(y - c.y) < 1.05) run.coins.add(c.k);
+  if (!run.portals && !run.top) {
     if (nearGround(lv, x, y) || /o/.test(tileAt(lv, cx, cy + 1))) run.base = y;
     else if (run.base - y > S.jump * PAD_MULT * PAD_MULT * 1.15 + 1.2) { bad = true; run.base = y; }
   }
@@ -465,7 +534,7 @@ export const room = {
       if (!L || me.rid !== rid) return;
       const p = makePlayer(L.lv);
       me.level = id; me.x = p.x; me.y = p.y; me.dirty = true;
-      me.run = { start: Date.now(), lv: L.lv, minMs: L.minMs, portals: L.portals, lx: p.x, ly: p.y, lt: Date.now() - 300, base: p.y, strikes: 0 };
+      me.run = { start: Date.now(), lv: L.lv, minMs: L.minMs, portals: L.portals, top: L.top, coinsAll: L.coins, coins: new Set(), lx: p.x, ly: p.y, lt: Date.now() - 300, base: p.y, strikes: 0 };
       if (me.levelAnnounced !== id) { me.levelAnnounced = id; room.broadcast({ type: "lvl", id: me.id, level: id }); }
       conn.send({ type: "spawned", rid, now: Date.now() });
       return;
@@ -488,6 +557,7 @@ export const room = {
           if (tileAt(lv, cx, cy) === "G" && Math.abs(me.x - (cx + 0.5)) < 1.05 && Math.abs(me.y - (cy + 0.5)) < 1.05) onGoal = true;
       const elapsed = now - run.start;
       if (!onGoal) return conn.send({ type: "reject", rid: me.rid, reason: "Finish not verified" });
+      if (run.coins.size < run.coinsAll.length) return conn.send({ type: "reject", rid: me.rid, reason: "Missing coins" });
       if (elapsed < run.minMs || r === "bad" && run.strikes >= 2) return conn.send({ type: "reject", rid: me.rid, reason: "Run rejected" });
 
       const levelId = me.level;

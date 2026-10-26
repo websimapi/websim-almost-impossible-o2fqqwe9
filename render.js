@@ -1,5 +1,7 @@
 import { enemyPos, PR } from "./server.js";
 
+const SAFE = "#9be89b";
+
 export function shade(hex, amt) {
   const n = parseInt(hex.slice(1), 16);
   let r = n >> 16, g = (n >> 8) & 255, b = n & 255;
@@ -23,7 +25,7 @@ export function drawBackground(ctx, W, H, bg) {
 }
 
 // Draw one tile at screen (sx, sy) with size ts.
-export function drawTile(ctx, c, sx, sy, ts, t = 0) {
+export function drawTile(ctx, c, sx, sy, ts, t = 0, top = false) {
   const lw = Math.max(1, ts * 0.06);
   ctx.lineWidth = lw;
   ctx.lineJoin = "round";
@@ -74,6 +76,18 @@ export function drawTile(ctx, c, sx, sy, ts, t = 0) {
     ctx.lineTo(sx + ts * 0.64, sy + ts / 2 - dir * ts * 0.05);
     ctx.fill();
     ctx.globalAlpha = 1;
+  } else if (c === "c") {
+    const r = ts * 0.22, bob = Math.sin(t * 4 + sx * 0.05) * ts * 0.04;
+    ctx.fillStyle = "#ffd23f";
+    ctx.beginPath();
+    ctx.arc(sx + ts / 2, sy + ts / 2 + bob, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.lineWidth = Math.max(1.2, ts * 0.05);
+    ctx.strokeStyle = "#050507";
+    ctx.stroke();
+  } else if (c === "G" && top) {
+    ctx.fillStyle = SAFE;
+    ctx.fillRect(sx, sy, ts, ts);
   } else if (c === "G") {
     const n = 4, q = ts / n;
     for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
@@ -87,7 +101,15 @@ export function drawEnemy(ctx, e, sx, sy, ts, t) {
   const s = e.size * ts;
   ctx.save();
   ctx.translate(sx, sy);
-  if (e.kind === "block") {
+  if (e.kind === "dot") {
+    ctx.fillStyle = "#2f6bff";
+    ctx.beginPath();
+    ctx.arc(0, 0, s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.lineWidth = Math.max(1.5, ts * 0.07);
+    ctx.strokeStyle = "#050507";
+    ctx.stroke();
+  } else if (e.kind === "block") {
     ctx.fillStyle = "#050507";
     ctx.fillRect(-s, -s, s * 2, s * 2);
     ctx.strokeStyle = "#ff3b5c";
@@ -116,16 +138,31 @@ export function drawEnemy(ctx, e, sx, sy, ts, t) {
 }
 
 // cam: { ox, oy, ts, W, H } — world tile (x,y) maps to screen ((x-ox)*ts, (y-oy)*ts)
-export function drawWorld(ctx, lv, cam, t, et, bg) {
+// hidden: optional Set of "x,y" coin keys already collected
+export function drawWorld(ctx, lv, cam, t, et, bg, hidden) {
   const { ox, oy, ts, W, H } = cam;
-  drawBackground(ctx, W, H, bg || lv.settings.bg);
+  const top = lv.settings.view === "top";
+  bg = bg || lv.settings.bg;
+  drawBackground(ctx, W, H, bg);
   const x0 = Math.max(0, Math.floor(ox)), x1 = Math.min(lv.w - 1, Math.floor(ox + W / ts));
   const y0 = Math.max(0, Math.floor(oy)), y1 = Math.min(lv.h - 1, Math.floor(oy + H / ts));
+  if (top) {
+    // checkered floor under every walkable cell, green safe zone on spawn
+    const fa = shade(bg, 0.86), fb = shade(bg, 0.74);
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      if (lv.rows[y][x] === "#") continue;
+      ctx.fillStyle = (x + y) % 2 ? fa : fb;
+      ctx.fillRect((x - ox) * ts, (y - oy) * ts, ts + 0.5, ts + 0.5);
+    }
+    ctx.fillStyle = SAFE;
+    ctx.fillRect((lv.spawn.x - ox) * ts, (lv.spawn.y - oy) * ts, ts, ts);
+  }
   for (let y = y0; y <= y1; y++) {
     const row = lv.rows[y];
     for (let x = x0; x <= x1; x++) {
       const c = row[x];
-      if (c !== ".") drawTile(ctx, c, (x - ox) * ts, (y - oy) * ts, ts, t);
+      if (c === "." || (c === "c" && hidden?.has(x + "," + y))) continue;
+      drawTile(ctx, c, (x - ox) * ts, (y - oy) * ts, ts, t, top);
     }
   }
   for (const e of lv.enemies) {

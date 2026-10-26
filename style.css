@@ -37,6 +37,8 @@ html, body {
   cursor: pointer;
 }
 button.chip:hover { background: rgba(255, 138, 31, 0.9); }
+.hud-mid { display: flex; gap: 6px; }
+#coins { color: #ffd23f; min-width: 0; }
 .mono { font-variant-numeric: tabular-nums; cursor: default; min-width: 70px; text-align: center; }
 #online { cursor: default; opacity: 0.75; }
 

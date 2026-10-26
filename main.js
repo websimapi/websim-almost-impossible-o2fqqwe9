@@ -1,14 +1,14 @@
 import * as shared from "./server.js";
 import * as render from "./render.js";
 
-const { normalizeLevel, makePlayer, stepPlayer } = shared;
+const { normalizeLevel, makePlayer, step, coinList } = shared;
 const { drawWorld, drawPlayer, mixHex } = render;
 
 const $ = (id) => document.getElementById(id);
 const cv = $("game"), ctx = cv.getContext("2d");
 const STEP = 1 / 120;
 
-const sfx = Object.fromEntries(["jump", "die", "win"].map((n) => {
+const sfx = Object.fromEntries(["jump", "die", "win", "coin"].map((n) => {
   const a = new Audio(`./sfx/${n}.wav`);
   a.volume = n === "jump" ? 0.35 : 0.6;
   return [n, a];
@@ -37,8 +37,9 @@ resize();
 
 // ---------------------------------------------------------------- input
 const keys = new Set();
-const inp = { x: 0, jump: false, jumpPressed: false };
-const touch = { x: 0, stickJump: false, tapJump: 0 };
+const inp = { x: 0, y: 0, jump: false, jumpPressed: false };
+const touch = { x: 0, y: 0, stickJump: false, tapJump: 0 };
+const isTop = () => S.lv?.settings.view === "top";
 const isTyping = (e) => /INPUT|TEXTAREA|SELECT/.test(e.target?.tagName) || e.target?.isContentEditable;
 const JUMP_KEYS = ["ArrowUp", "KeyW", "Space"];
 
@@ -58,6 +59,10 @@ function readInput() {
   if (keys.has("ArrowRight") || keys.has("KeyD")) x += 1;
   if (!x) x = touch.x;
   inp.x = x;
+  let y = 0;
+  if (keys.has("ArrowUp") || keys.has("KeyW")) y -= 1;
+  if (keys.has("ArrowDown") || keys.has("KeyS")) y += 1;
+  inp.y = y || touch.y;
   inp.jump = JUMP_KEYS.some((k) => keys.has(k)) || touch.stickJump || touch.tapJump > 0;
 }
 
@@ -74,6 +79,7 @@ function stickMove(e) {
   knob.style.transform = `translate(${dx}px, ${dy}px)`;
   const nx = dx / R, ny = dy / R;
   touch.x = Math.abs(nx) < 0.15 ? 0 : nx;
+  touch.y = Math.abs(ny) < 0.15 ? 0 : ny;
   const j = ny < -0.5;
   if (j && !touch.stickJump) inp.jumpPressed = true;
   touch.stickJump = j;
@@ -82,13 +88,13 @@ stick.addEventListener("pointerdown", (e) => { stickId = e.pointerId; stick.setP
 stick.addEventListener("pointermove", (e) => { if (e.pointerId === stickId) stickMove(e); });
 const stickEnd = (e) => {
   if (e.pointerId !== stickId) return;
-  stickId = null; touch.x = 0; touch.stickJump = false; knob.style.transform = "";
+  stickId = null; touch.x = 0; touch.y = 0; touch.stickJump = false; knob.style.transform = "";
 };
 stick.addEventListener("pointerup", stickEnd);
 stick.addEventListener("pointercancel", stickEnd);
 // tapping the right half of the screen also jumps
 cv.addEventListener("pointerdown", (e) => {
-  if (e.pointerType === "mouse" || e.clientX < W / 2) return;
+  if (e.pointerType === "mouse" || e.clientX < W / 2 || isTop()) return;
   inp.jumpPressed = true; touch.tapJump++;
 });
 const tapUp = (e) => { if (e.pointerType !== "mouse" && e.clientX >= W / 2) touch.tapJump = Math.max(0, touch.tapJump - 1); };
@@ -196,6 +202,7 @@ function respawn() {
   S.bg = S.lv.settings.bg;
   S.mode = S.test ? "test" : "play";
   timerEl.hidden = false;
+  updateCoins();
   showAttempt();
   if (!S.test) send({ type: "spawn", level: S.levelId, rid: S.rid });
 }
@@ -224,6 +231,13 @@ function finish() {
   setTimeout(() => {
     if (S.mode === "finishing" && S.rid === rid && S.verified !== rid) { say("Couldn't verify run — not connected", 1800); respawn(); }
   }, 5000);
+}
+
+const coinsEl = $("coins");
+function updateCoins() {
+  const total = S.lv ? coinList(S.lv).length : 0;
+  coinsEl.hidden = !total;
+  if (total) coinsEl.textContent = `● ${S.p.coins.size}/${total}`;
 }
 
 function burst(x, y) {
@@ -383,7 +397,13 @@ function frame(now) {
     acc += dt;
     while (acc >= STEP) {
       acc -= STEP;
-      const ev = stepPlayer(S.p, inp, STEP, S.lv, enemyTime());
+      const ev = step(S.p, inp, STEP, S.lv, enemyTime());
+      if (S.p.gotCoin) {
+        S.p.gotCoin = false;
+        play("coin");
+        updateCoins();
+        send({ type: "pos", rid: S.rid, x: +S.p.x.toFixed(3), y: +S.p.y.toFixed(3), t: serverNow() });
+      }
       inp.jumpPressed = false;
       if (S.p.jumped) { S.p.jumped = false; play("jump"); }
       if (S.p.padded) { S.p.padded = false; play("jump"); }
@@ -409,11 +429,15 @@ function draw(dt) {
     return;
   }
   const lv = S.lv, p = S.p;
-  const ts = Math.max(18, Math.min(H / 11, W / 16));
+  const top = lv.settings.view === "top";
+  // top-down: fit the whole maze when it reasonably can; side: fixed zoom that follows
+  const ts = top
+    ? Math.max(Math.min(H / 11, W / 16) * 0.45, Math.min(H / (lv.h + 1), W / (lv.w + 1), 64))
+    : Math.max(18, Math.min(H / 11, W / 16));
   const vw = W / ts, vh = H / ts;
-  let tx = p.x - (lv.settings.autorun ? vw * 0.3 : vw * 0.5);
+  let tx = p.x - (lv.settings.autorun && !top ? vw * 0.3 : vw * 0.5);
   tx = lv.w > vw ? Math.max(0, Math.min(lv.w - vw, tx)) : (lv.w - vw) / 2;
-  let ty = p.y - vh * 0.55;
+  let ty = p.y - vh * (top ? 0.5 : 0.55);
   ty = lv.h > vh ? Math.max(0, Math.min(lv.h - vh, ty)) : (lv.h - vh) / 2;
   if (!S.cam) S.cam = { x: tx, y: ty };
   const k = 1 - Math.exp(-dt * (S.mode === "dead" ? 3 : 10));
@@ -426,9 +450,9 @@ function draw(dt) {
 
   const cam = { ox: S.cam.x, oy: S.cam.y, ts, W, H };
   const t = performance.now() / 1000;
-  drawWorld(ctx, lv, cam, t, enemyTime(), S.bg);
+  drawWorld(ctx, lv, cam, t, enemyTime(), S.bg, p.coins);
   const floorY = (lv.h - cam.oy) * ts;
-  if (floorY < H) { ctx.fillStyle = "rgba(0,0,0,0.35)"; ctx.fillRect(0, floorY, W, H - floorY); }
+  if (floorY < H && !top) { ctx.fillStyle = "rgba(0,0,0,0.35)"; ctx.fillRect(0, floorY, W, H - floorY); }
 
   // other players on this level
   if (!S.test) {
