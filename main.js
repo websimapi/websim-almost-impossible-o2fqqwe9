@@ -1,5 +1,6 @@
 import * as shared from "./server.js";
 import * as render from "./render.js";
+import { createMap } from "./map.js";
 
 const { normalizeLevel, makePlayer, step, coinList } = shared;
 const { drawWorld, drawPlayer, mixHex } = render;
@@ -16,7 +17,7 @@ const sfx = Object.fromEntries(["jump", "die", "win", "coin"].map((n) => {
 const play = (n) => { const a = sfx[n].cloneNode(); a.volume = sfx[n].volume; a.play().catch(() => {}); };
 
 const S = {
-  me: null, myId: null, levels: [], progress: {}, levelId: null, lv: null,
+  me: null, myId: null, levels: [], archived: [], progress: {}, myRatings: {}, levelId: null, lv: null,
   p: null, rid: 0, attempt: 0, runStart: 0, mode: "loading", paused: false,
   others: new Map(), offset: 0, room: null, cam: null, bg: "#3b2a8c",
   particles: [], test: null, levelCache: new Map(),
@@ -111,7 +112,7 @@ function say(html, ms = 0) {
   if (ms) centerTimer = setTimeout(() => (center.hidden = true), ms);
 }
 const fmt = (ms) => (ms == null ? "—" : (ms / 1000).toFixed(2) + "s");
-const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
 function showAttempt() {
   attemptEl.textContent = `Attempt ${S.attempt}`;
@@ -119,41 +120,56 @@ function showAttempt() {
   requestAnimationFrame(() => setTimeout(() => attemptEl.classList.remove("show"), 700));
 }
 
-const lvlBtn = $("lvlBtn"), lvlMenu = $("lvlMenu");
-function unlockedIdx(i) {
-  if (S.me?.isOwner || i === 0) return true;
-  return !!S.progress[S.levels[i - 1].id];
-}
-function updateLevelUI() {
-  const i = S.levels.findIndex((l) => l.id === S.levelId);
-  lvlBtn.hidden = !S.levels.length;
-  lvlBtn.textContent = i >= 0 ? `${i + 1} · ${S.levels[i].name} ▼` : "Levels ▼";
-  lvlMenu.innerHTML = "";
-  S.levels.forEach((l, idx) => {
-    const b = document.createElement("button");
-    const pr = S.progress[l.id];
-    const open = unlockedIdx(idx);
-    b.disabled = !open;
-    if (l.id === S.levelId) b.className = "cur";
-    b.innerHTML = `<span>${idx + 1}. ${esc(l.name)}</span><span class="t">${open ? (pr ? "★ " + fmt(pr.best) : "") : "🔒"}</span>`;
-    b.onclick = () => { lvlMenu.hidden = true; loadLevel(l.id); };
-    lvlMenu.appendChild(b);
-  });
-}
-lvlBtn.onclick = (e) => { e.stopPropagation(); lvlMenu.hidden = !lvlMenu.hidden; };
-addEventListener("pointerdown", (e) => { if (!lvlMenu.contains(e.target) && e.target !== lvlBtn) lvlMenu.hidden = true; });
-
 function updateOnline() {
   const n = S.others.size + 1;
   $("online").hidden = n < 2;
   $("online").textContent = `● ${n} online`;
 }
 
+// ---------------------------------------------------------------- progression
+// A level is open if: it's first in the stack, you unlocked it before (unlocks
+// are permanent even when the stack reshuffles), the level right before it is
+// beaten, or it's yours. The server applies the same rule.
+const beaten = (id) => (S.progress[id]?.completions || 0) > 0;
+function isOpen(i) {
+  const l = S.levels[i];
+  if (!l) return false;
+  return !!(S.me?.isOwner || l.mine || i === 0 || S.progress[l.id] || (i > 0 && beaten(S.levels[i - 1].id)));
+}
+function levelState(i) {
+  const l = S.levels[i];
+  if (beaten(l.id)) return "beaten";
+  return isOpen(i) ? "open" : "locked";
+}
+function continueIndex() {
+  return S.levels.findIndex((l, i) => !beaten(l.id) && isOpen(i));
+}
+
+function mergeProgress(src) {
+  for (const [id, p] of Object.entries(src || {})) {
+    const cur = S.progress[id];
+    if (!cur) { S.progress[id] = { ...p }; continue; }
+    cur.completions = Math.max(cur.completions || 0, p.completions || 0);
+    if (p.best != null) cur.best = cur.best == null ? p.best : Math.min(cur.best, p.best);
+  }
+}
+
+const mapBtn = $("mapBtn");
+function updateLevelUI() {
+  const i = S.levels.findIndex((l) => l.id === S.levelId);
+  mapBtn.hidden = !S.levels.length && !S.archived.length;
+  mapBtn.textContent = i >= 0 ? `Map · #${i + 1} ${S.levels[i].name}` : "Level map";
+  map.refresh();
+}
+
 // ---------------------------------------------------------------- levels
 async function refreshLevels() {
-  try {
-    S.levels = await (await fetch("/api/levels")).json();
-  } catch { return; }
+  let d;
+  try { d = await (await fetch("/api/levels")).json(); } catch { return; }
+  S.levels = d.levels || [];
+  S.archived = d.archived || [];
+  S.myRatings = d.myRatings || {};
+  mergeProgress(d.progress);
   updateLevelUI();
   if ((S.mode === "empty" || S.mode === "done") && !S.test) pickStartLevel();
 }
@@ -173,16 +189,19 @@ function pickStartLevel() {
   if (!S.levels.length) {
     S.mode = "empty"; S.lv = null; S.levelId = null;
     timerEl.hidden = true;
-    say("No levels yet");
+    say(S.me?.signedIn ? "No levels yet<small>Be the first — tap + Create</small>" : "No levels yet");
     updateLevelUI();
     return;
   }
-  const first = S.levels.find((l) => !S.progress[l.id]);
-  if (first) loadLevel(first.id);
-  else if (S.mode !== "done") loadLevel(S.levels[S.levels.length - 1].id);
+  const i = continueIndex();
+  if (i >= 0) return loadLevel(S.levels[i].id);
+  S.mode = "done";
+  updateLevelUI();
+  say("You beat every level!<small>New levels appear as players make them</small>");
 }
 
 async function loadLevel(id) {
+  hideResult();
   const data = await fetchLevel(id);
   if (!data) return refreshLevels();
   S.levelId = id;
@@ -200,11 +219,13 @@ function respawn() {
   S.p = makePlayer(S.lv);
   S.runStart = serverNow();
   S.bg = S.lv.settings.bg;
-  S.mode = S.test ? "test" : "play";
+  S.mode = S.test && !S.test.verify ? "test" : "play";
   timerEl.hidden = false;
   updateCoins();
   showAttempt();
-  if (!S.test) send({ type: "spawn", level: S.levelId, rid: S.rid });
+  if (S.mode === "play") {
+    send(S.test ? { type: "spawn", level: S.test.levelId, rid: S.rid, verify: true } : { type: "spawn", level: S.levelId, rid: S.rid });
+  }
 }
 
 function die() {
@@ -218,14 +239,13 @@ function die() {
 function finish() {
   play("win");
   const t = serverNow() - S.runStart;
-  if (S.test) {
-    S.mode = "finishing";
+  S.mode = "finishing";
+  if (S.test && !S.test.verify) {
     say(`Test complete<small>${fmt(t)}</small>`, 1400);
     setTimeout(() => { if (S.test) respawn(); }, 1500);
     return;
   }
-  S.mode = "finishing";
-  say(`Level complete!<small>checking…</small>`);
+  say(`${S.test ? "Verifying" : "Level complete!"}<small>checking run…</small>`);
   send({ type: "finish", rid: S.rid, x: S.p.x, y: S.p.y, t: serverNow() });
   const rid = S.rid;
   setTimeout(() => {
@@ -247,6 +267,90 @@ function burst(x, y) {
   }
 }
 
+// ---------------------------------------------------------------- rating
+async function rate(levelId, stars) {
+  const r = await fetch("/api/rate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ level_id: levelId, stars }) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { say(esc(d.error || "Couldn't rate"), 1600); return false; }
+  S.myRatings[levelId] = stars;
+  map.refresh();
+  setTimeout(refreshLevels, 300);
+  return true;
+}
+
+function starPicker(current, onPick) {
+  const wrap = document.createElement("div");
+  wrap.className = "stars pick";
+  const paint = (n) => [...wrap.children].forEach((b, i) => b.classList.toggle("on", i < n));
+  for (let i = 1; i <= 5; i++) {
+    const b = document.createElement("button");
+    b.textContent = "★";
+    b.title = `${i} star${i > 1 ? "s" : ""}`;
+    b.onmouseenter = () => paint(i);
+    b.onmouseleave = () => paint(current || 0);
+    b.onclick = async () => { if (await onPick(i)) { current = i; paint(i); } };
+    wrap.append(b);
+  }
+  paint(current || 0);
+  return wrap;
+}
+
+// ---------------------------------------------------------------- result panel
+const resultEl = $("result");
+let resultNext = null;
+function showResult(m) {
+  say("");
+  const lvl = S.levels.find((l) => l.id === m.level);
+  const pb = m.best === m.time ? "New best!" : `Best ${fmt(m.best)}`;
+  resultEl.replaceChildren();
+  const add = (tag, cls, html) => { const e = document.createElement(tag); e.className = cls; e.innerHTML = html; resultEl.append(e); return e; };
+  add("div", "r-title", "Level complete!");
+  add("div", "r-sub", `${esc(lvl?.name || "")}${lvl?.author ? ` <span class="muted">by @${esc(lvl.author)}</span>` : ""}`);
+  add("div", "r-time", `${fmt(m.time)} <span class="muted">· ${pb} · beaten ${m.completions}×</span>`);
+  if (m.canRate) {
+    add("div", "r-label", S.myRatings[m.level] ? "Your rating" : "Rate this level");
+    resultEl.append(starPicker(S.myRatings[m.level], (n) => rate(m.level, n)));
+  } else if (!m.saved) {
+    add("div", "r-label", "Sign in to save progress and rate levels");
+  }
+  const btns = add("div", "r-btns", "");
+  const mapB = document.createElement("button");
+  mapB.className = "chip"; mapB.textContent = "Level map";
+  mapB.onclick = () => { hideResult(); openMap(); };
+  const nextB = document.createElement("button");
+  nextB.className = "chip pri";
+  resultNext = () => {
+    hideResult();
+    const i = continueIndex();
+    const nextIdx = S.levels.findIndex((l) => l.id === m.next);
+    if (m.next && nextIdx >= 0 && !beaten(m.next)) loadLevel(m.next);
+    else if (i >= 0) loadLevel(S.levels[i].id);
+    else pickStartLevel();
+  };
+  nextB.textContent = "Next ▶";
+  nextB.onclick = resultNext;
+  const retry = document.createElement("button");
+  retry.className = "chip"; retry.textContent = "Replay";
+  retry.onclick = () => { hideResult(); loadLevel(m.level); };
+  btns.append(mapB, retry, nextB);
+  resultEl.hidden = false;
+}
+function hideResult() { resultEl.hidden = true; resultNext = null; }
+addEventListener("keydown", (e) => {
+  if (resultNext && !resultEl.hidden && (e.code === "Enter" || e.code === "Space") && !isTyping(e)) { e.preventDefault(); resultNext(); }
+});
+
+// ---------------------------------------------------------------- map
+const map = createMap({
+  get S() { return S; },
+  levelState, isOpen, continueIndex, starPicker, rate, fmt, esc,
+  play: (id) => { closeMap(); loadLevel(id); },
+});
+function openMap() { S.paused = true; keys.clear(); map.open(); }
+function closeMap() { map.close(); S.paused = false; }
+map.onClose = () => (S.paused = false);
+mapBtn.onclick = openMap;
+
 // ---------------------------------------------------------------- network
 function onMessage(ev) {
   let m;
@@ -254,12 +358,13 @@ function onMessage(ev) {
   if (m.type === "welcome") {
     S.myId = m.id;
     S.offset = m.now - Date.now();
-    S.progress = m.progress || {};
+    mergeProgress(m.progress);
     S.others.clear();
     for (const p of m.players) S.others.set(p.id, { ...p, x: 0, y: 0, tx: 0, ty: 0, seen: false });
     updateOnline();
+    updateLevelUI();
     if (S.mode === "loading") pickStartLevel();
-    else if (S.lv && !S.test && (S.mode === "play" || S.mode === "dead")) respawn();
+    else if (S.lv && (S.mode === "play" || S.mode === "dead")) respawn();
   } else if (m.type === "join") {
     S.others.set(m.player.id, { ...m.player, x: 0, y: 0, tx: 0, ty: 0, seen: false });
     updateOnline();
@@ -284,27 +389,26 @@ function onMessage(ev) {
     }
   } else if (m.type === "reject") {
     if (m.rid !== S.rid) return;
-    say(esc(m.reason), 1800);
-    if (/Locked|unavailable/.test(m.reason)) { S.mode = "idle"; setTimeout(() => { refreshLevels().then(pickStartLevel); }, 1200); }
-    else setTimeout(respawn, 900);
+    say(esc(m.reason), 2200);
+    if (/Locked|unavailable|Not your|Sign in|goal/.test(m.reason)) {
+      S.mode = "idle";
+      if (S.test) setTimeout(() => endTest(null), 1600);
+      else setTimeout(() => refreshLevels().then(pickStartLevel), 1200);
+    } else setTimeout(respawn, 900);
+  } else if (m.type === "verified") {
+    if (m.rid !== S.rid || !S.test) return;
+    S.verified = m.rid;
+    say(`Verified!<small>${fmt(m.time)} · your level is live</small>`);
+    setTimeout(() => endTest({ ok: true, time: m.time }), 1800);
   } else if (m.type === "result") {
     if (m.rid !== S.rid) return;
     S.verified = m.rid;
     S.progress[m.level] = { best: m.best, completions: m.completions };
+    if (m.next && !S.progress[m.next]) S.progress[m.next] = { best: null, completions: 0 };
+    S.mode = "result";
     updateLevelUI();
-    const pb = m.best === m.time ? " · new best!" : ` · best ${fmt(m.best)}`;
-    const note = m.saved ? "" : "<small>Sign in to save your progress</small>";
-    say(`Level complete!<small>${fmt(m.time)}${pb}</small>${note}`);
-    setTimeout(async () => {
-      if (S.mode !== "finishing" || S.levelId !== m.level) return;
-      if (m.next) {
-        if (!S.levels.some((l) => l.id === m.next)) await refreshLevels();
-        loadLevel(m.next);
-      } else {
-        S.mode = "done";
-        say(`You beat every level!<small>More coming soon</small>`);
-      }
-    }, 2000);
+    showResult(m);
+    refreshLevels();
   }
 }
 
@@ -319,29 +423,7 @@ async function connect() {
   S.room.onclose = (e) => say(`Disconnected<small>${esc(e.reason || "")}</small>`);
 }
 
-// ---------------------------------------------------------------- admin & tests
-const adminBtn = $("adminBtn");
-let adminMod = null;
-adminBtn.onclick = async () => {
-  if (!adminMod) {
-    adminBtn.disabled = true;
-    try {
-      const r = await fetch("/api/admin/code");
-      if (!r.ok) throw new Error((await r.json()).error);
-      const url = URL.createObjectURL(new Blob([await r.text()], { type: "text/javascript" }));
-      adminMod = await import(url);
-    } catch (err) {
-      say(`Admin unavailable<small>${esc(err.message)}</small>`, 2500);
-      return;
-    } finally {
-      adminBtn.disabled = false;
-    }
-  }
-  S.paused = true;
-  keys.clear();
-  adminMod.default({ shared, render, api, playtest, close: closeAdmin });
-};
-
+// ---------------------------------------------------------------- editor / admin modules (code lives in the DB)
 async function api(path, opts = {}) {
   const r = await fetch(path, {
     ...opts,
@@ -353,7 +435,43 @@ async function api(path, opts = {}) {
   return d;
 }
 
-async function closeAdmin() {
+const modules = {};
+async function loadModule(name, path) {
+  if (!modules[name]) {
+    const r = await fetch(path);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`);
+    const url = URL.createObjectURL(new Blob([await r.text()], { type: "text/javascript" }));
+    modules[name] = await import(url);
+  }
+  return modules[name];
+}
+
+function moduleCtx() {
+  return { shared, render, api, playtest, verify, close: closeModules, openEditor, me: S.me };
+}
+
+async function openEditor(opts = {}) {
+  let mod;
+  try { mod = await loadModule("editor", "/api/editor/code"); }
+  catch (err) { say(`Editor unavailable<small>${esc(err.message)}</small>`, 2500); return; }
+  hideResult();
+  S.paused = true;
+  keys.clear();
+  mod.default(moduleCtx(), opts);
+}
+
+$("createBtn").onclick = () => openEditor();
+$("adminBtn").onclick = async () => {
+  let mod;
+  try { mod = await loadModule("admin", "/api/admin/code"); }
+  catch (err) { say(`Admin unavailable<small>${esc(err.message)}</small>`, 2500); return; }
+  hideResult();
+  S.paused = true;
+  keys.clear();
+  mod.default(moduleCtx());
+};
+
+async function closeModules() {
   S.paused = false;
   S.levelCache.clear();
   await refreshLevels();
@@ -361,31 +479,41 @@ async function closeAdmin() {
   else pickStartLevel();
 }
 
+// Local practice run of unsaved editor data.
 function playtest(data) {
+  return startTest(data, { verify: false });
+}
+// Server-checked run of a saved level; resolves {ok,time} when the server verifies it.
+function verify(levelId, data) {
+  return startTest(data, { verify: true, levelId });
+}
+function startTest(data, opts) {
   return new Promise((resolve) => {
-    S.test = { resolve, prev: { lv: S.lv, levelId: S.levelId, mode: S.mode, attempt: S.attempt } };
+    S.test = { resolve, ...opts, prev: { lv: S.lv, levelId: S.levelId, attempt: S.attempt, p: S.p } };
     S.paused = false;
     S.lv = normalizeLevel(data);
     S.attempt = 0;
     S.cam = null;
+    $("testLabel").textContent = opts.verify ? "Verification run — beat your level to publish it" : "Practice test (not recorded)";
     $("testBar").hidden = false;
     say("");
     respawn();
   });
 }
-function endTest() {
+function endTest(result = null) {
   if (!S.test) return;
   const { resolve, prev } = S.test;
   S.test = null;
+  S.rid++; // drop any in-flight server run
   $("testBar").hidden = true;
   Object.assign(S, prev);
   S.cam = null;
   S.paused = true;
-  say("");
   S.mode = "idle";
-  resolve();
+  say("");
+  resolve(result);
 }
-$("testExit").onclick = endTest;
+$("testExit").onclick = () => endTest(null);
 
 // ---------------------------------------------------------------- loop
 let last = performance.now(), acc = 0, sendAcc = 0;
@@ -398,13 +526,13 @@ function frame(now) {
     while (acc >= STEP) {
       acc -= STEP;
       const ev = step(S.p, inp, STEP, S.lv, enemyTime());
+      inp.jumpPressed = false;
       if (S.p.gotCoin) {
         S.p.gotCoin = false;
         play("coin");
         updateCoins();
-        send({ type: "pos", rid: S.rid, x: +S.p.x.toFixed(3), y: +S.p.y.toFixed(3), t: serverNow() });
+        if (S.mode === "play") send({ type: "pos", rid: S.rid, x: +S.p.x.toFixed(3), y: +S.p.y.toFixed(3), t: serverNow() });
       }
-      inp.jumpPressed = false;
       if (S.p.jumped) { S.p.jumped = false; play("jump"); }
       if (S.p.padded) { S.p.padded = false; play("jump"); }
       if (ev === "dead") { die(); break; }
@@ -424,7 +552,7 @@ function frame(now) {
 }
 
 function draw(dt) {
-  if (!S.lv) {
+  if (!S.lv || !S.p) {
     render.drawBackground(ctx, W, H, "#3b2a8c");
     return;
   }
@@ -441,11 +569,11 @@ function draw(dt) {
   ty = lv.h > vh ? Math.max(0, Math.min(lv.h - vh, ty)) : (lv.h - vh) / 2;
   if (!S.cam) S.cam = { x: tx, y: ty };
   const k = 1 - Math.exp(-dt * (S.mode === "dead" ? 3 : 10));
-  S.cam.x = lv.settings.autorun && S.mode !== "dead" ? tx : S.cam.x + (tx - S.cam.x) * k;
+  S.cam.x = lv.settings.autorun && !top && S.mode !== "dead" ? tx : S.cam.x + (tx - S.cam.x) * k;
   S.cam.y += (ty - S.cam.y) * (1 - Math.exp(-dt * 6));
 
   let target = lv.settings.bg;
-  for (const c of lv.colors) if (c.x <= p.x) target = c.color;
+  if (!top) for (const c of lv.colors) if (c.x <= p.x) target = c.color;
   S.bg = mixHex(S.bg, target, 1 - Math.exp(-dt * 4));
 
   const cam = { ox: S.cam.x, oy: S.cam.y, ts, W, H };
@@ -464,7 +592,6 @@ function draw(dt) {
     }
   }
 
-  // particles
   for (const q of S.particles) {
     q.life -= dt; q.vy += 30 * dt; q.x += q.vx * dt; q.y += q.vy * dt;
     ctx.fillStyle = `rgba(255,138,31,${Math.max(0, q.life / 0.7)})`;
@@ -479,10 +606,11 @@ function draw(dt) {
 (async function boot() {
   requestAnimationFrame(frame);
   try { S.me = await (await fetch("/api/me")).json(); } catch { S.me = {}; }
-  adminBtn.hidden = !S.me.isOwner;
+  $("adminBtn").hidden = !S.me.isOwner;
+  $("createBtn").hidden = !S.me.signedIn;
   await refreshLevels();
   // don't make players stare at an empty screen if the room is slow to welcome us
   setTimeout(() => { if (S.mode === "loading") pickStartLevel(); }, 2500);
   await connect();
-  setInterval(refreshLevels, 20000);
+  setInterval(refreshLevels, 30000);
 })();

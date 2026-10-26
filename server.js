@@ -275,26 +275,86 @@ export function goalDistance(lv) {
 }
 
 // ============================================================
+// The level stack — community levels ordered by rating & time
+// ============================================================
+// Position in the stack: a Bayesian star rating (unrated levels start at 3★)
+// minus a penalty that grows with the average finish time, so well-loved,
+// quick levels come first and long, punishing ones sink further down.
+export const STACK_RULES = { prior: 3, priorWeight: 3, timeWeight: 0.8, timeScaleSec: 20, archiveOnes: 5, archiveAvg: 2 };
+
+export function rankScore(ratingSum, ratingCount, avgMs) {
+  const R = STACK_RULES;
+  const bayes = (ratingSum + R.prior * R.priorWeight) / (ratingCount + R.priorWeight);
+  return bayes - R.timeWeight * Math.log(1 + (avgMs || 0) / 1000 / R.timeScaleSec);
+}
+
+let stackCache = { at: 0, data: null };
+const invalidateStack = () => (stackCache.at = 0);
+
+async function getStack(env) {
+  if (stackCache.data && Date.now() - stackCache.at < 8000) return stackCache.data;
+  const [lv, rt, tm] = await env.DB.batch([
+    env.DB.prepare("SELECT id, user_id, username, name, view, perm_keep, verified_ms, created_at, updated_at FROM levels WHERE status = 'published'"),
+    env.DB.prepare("SELECT level_id, COUNT(*) AS n, SUM(stars) AS s, SUM(CASE WHEN stars = 1 THEN 1 ELSE 0 END) AS ones FROM ratings GROUP BY level_id"),
+    env.DB.prepare("SELECT level_id, AVG(time_ms) AS avg, COUNT(*) AS n FROM runs GROUP BY level_id"),
+  ]);
+  const ratings = new Map(rt.results.map((r) => [r.level_id, r]));
+  const times = new Map(tm.results.map((r) => [r.level_id, r]));
+  const all = lv.results.map((l) => {
+    const r = ratings.get(l.id) || { n: 0, s: 0, ones: 0 };
+    const t = times.get(l.id);
+    const avgMs = Math.round(t?.avg ?? l.verified_ms ?? 0);
+    const rating = r.n ? r.s / r.n : null;
+    return {
+      id: l.id, name: l.name, author: l.username, author_id: l.user_id, view: l.view,
+      rating, ratings: r.n, ones: r.ones || 0, avgMs, finishes: t?.n || 0,
+      keep: !!l.perm_keep, created_at: l.created_at, updated_at: l.updated_at,
+      archived: !l.perm_keep && (r.ones || 0) >= STACK_RULES.archiveOnes && rating !== null && rating < STACK_RULES.archiveAvg,
+      score: rankScore(r.s || 0, r.n, avgMs),
+    };
+  });
+  const live = all.filter((l) => !l.archived).sort((a, b) => b.score - a.score || a.created_at - b.created_at);
+  const data = { live, archived: all.filter((l) => l.archived), ids: live.map((l) => l.id), byId: new Map(all.map((l) => [l.id, l])) };
+  stackCache = { at: Date.now(), data };
+  return data;
+}
+
+// Public view of a stack entry (no user ids).
+function pub(l, uid) {
+  const { author_id, score, ...rest } = l;
+  return { ...rest, mine: !!uid && author_id === uid };
+}
+
+// ============================================================
 // Backend
 // ============================================================
 export const schema = `
   CREATE TABLE IF NOT EXISTS secrets (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS levels (id INTEGER PRIMARY KEY AUTOINCREMENT, num INTEGER NOT NULL, name TEXT NOT NULL, data TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS levels (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, username TEXT, name TEXT NOT NULL, view TEXT NOT NULL DEFAULT 'side', data TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', perm_keep INTEGER NOT NULL DEFAULT 0, verified_ms INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+  CREATE INDEX IF NOT EXISTS levels_user ON levels (user_id);
+  CREATE INDEX IF NOT EXISTS levels_status ON levels (status);
+  CREATE TABLE IF NOT EXISTS ratings (user_id TEXT NOT NULL, username TEXT, level_id INTEGER NOT NULL, stars INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (user_id, level_id));
   CREATE TABLE IF NOT EXISTS progress (user_id TEXT NOT NULL, username TEXT, level_id INTEGER NOT NULL, completions INTEGER NOT NULL DEFAULT 0, best_ms INTEGER, last_ms INTEGER, updated_at INTEGER, PRIMARY KEY (user_id, level_id));
   CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, username TEXT, level_id INTEGER NOT NULL, time_ms INTEGER NOT NULL, created_at INTEGER NOT NULL);
   CREATE INDEX IF NOT EXISTS runs_user ON runs (user_id);
+  CREATE INDEX IF NOT EXISTS runs_level ON runs (level_id);
   CREATE INDEX IF NOT EXISTS runs_created ON runs (created_at);
 `;
 
 const json = (d, status = 200) => Response.json(d, { status, headers: { "cache-control": "no-store" } });
 
-function isOwner(request) {
-  const uid = request.headers.get("x-websim-user-id");
-  return !!uid && uid === request.headers.get("x-websim-project-owner-id");
-}
-
 async function readBody(request) {
   try { return await request.json(); } catch { return {}; }
+}
+
+async function deleteLevel(env, id) {
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM levels WHERE id = ?").bind(id),
+    env.DB.prepare("DELETE FROM ratings WHERE level_id = ?").bind(id),
+    env.DB.prepare("DELETE FROM progress WHERE level_id = ?").bind(id),
+    env.DB.prepare("DELETE FROM runs WHERE level_id = ?").bind(id),
+  ]);
+  invalidateStack();
 }
 
 export default {
@@ -302,26 +362,111 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const m = request.method;
-    const owner = isOwner(request);
+    const uid = request.headers.get("x-websim-user-id");
+    const username = request.headers.get("x-websim-username");
+    const signedIn = !!uid && !!username && request.headers.get("x-websim-user-is-anonymous") !== "true";
+    const owner = !!uid && uid === request.headers.get("x-websim-project-owner-id");
+    let mm;
 
-    if (m === "GET" && path === "/api/me") {
+    if (m === "GET" && path === "/api/me") return json({ userId: uid, username, signedIn, isOwner: owner });
+
+    // The whole stack + this visitor's progress.
+    if (m === "GET" && path === "/api/levels") {
+      const st = await getStack(env);
+      const progress = {}, myRatings = {};
+      if (uid) {
+        const [p, r] = await env.DB.batch([
+          env.DB.prepare("SELECT level_id, completions, best_ms FROM progress WHERE user_id = ?").bind(uid),
+          env.DB.prepare("SELECT level_id, stars FROM ratings WHERE user_id = ?").bind(uid),
+        ]);
+        for (const x of p.results) progress[x.level_id] = { completions: x.completions, best: x.best_ms };
+        for (const x of r.results) myRatings[x.level_id] = x.stars;
+      }
       return json({
-        userId: request.headers.get("x-websim-user-id"),
-        username: request.headers.get("x-websim-username"),
-        isOwner: owner,
+        levels: st.live.map((l) => pub(l, uid)),
+        archived: st.archived.filter((l) => progress[l.id] || l.author_id === uid).map((l) => pub(l, uid)),
+        progress, myRatings, rules: STACK_RULES,
       });
     }
 
-    if (m === "GET" && path === "/api/levels") {
-      const { results } = await env.DB.prepare("SELECT id, num, name, updated_at FROM levels WHERE published = 1 ORDER BY num, id").all();
-      return json(results);
+    if (m === "GET" && (mm = path.match(/^\/api\/level\/(\d+)$/))) {
+      const row = await env.DB.prepare("SELECT id, user_id, username, name, data, status, updated_at FROM levels WHERE id = ?").bind(+mm[1]).first();
+      if (!row || (row.status !== "published" && !owner && row.user_id !== uid)) return json({ error: "Not found" }, 404);
+      return json({ id: row.id, name: row.name, author: row.username, status: row.status, updated_at: row.updated_at, data: normalizeLevel(JSON.parse(row.data)) });
     }
 
-    let mm;
-    if (m === "GET" && (mm = path.match(/^\/api\/level\/(\d+)$/))) {
-      const row = await env.DB.prepare("SELECT id, num, name, data, published, updated_at FROM levels WHERE id = ?").bind(+mm[1]).first();
-      if (!row || (!row.published && !owner)) return json({ error: "Not found" }, 404);
-      return json({ id: row.id, name: row.name, updated_at: row.updated_at, data: normalizeLevel(JSON.parse(row.data)) });
+    // Rate a level you have beaten (server checks your verified progress).
+    if (m === "POST" && path === "/api/rate") {
+      if (!signedIn) return json({ error: "Sign in to rate levels" }, 401);
+      const b = await readBody(request);
+      const id = +b.level_id, stars = Math.round(+b.stars);
+      if (!(stars >= 1 && stars <= 5)) return json({ error: "Stars must be 1-5" }, 400);
+      const [lvl, pr] = await env.DB.batch([
+        env.DB.prepare("SELECT user_id, status FROM levels WHERE id = ?").bind(id),
+        env.DB.prepare("SELECT completions FROM progress WHERE user_id = ? AND level_id = ?").bind(uid, id),
+      ]);
+      const L = lvl.results[0];
+      if (!L || L.status !== "published") return json({ error: "Level not found" }, 404);
+      if (L.user_id === uid) return json({ error: "You can't rate your own level" }, 403);
+      if (!(pr.results[0]?.completions > 0)) return json({ error: "Beat the level to rate it" }, 403);
+      await env.DB.prepare(
+        "INSERT INTO ratings (user_id, username, level_id, stars, created_at) VALUES (?, ?, ?, ?, ?) " +
+        "ON CONFLICT(user_id, level_id) DO UPDATE SET stars = excluded.stars, username = excluded.username, created_at = excluded.created_at"
+      ).bind(uid, username, id, stars, Date.now()).run();
+      invalidateStack();
+      return json({ ok: true, stars });
+    }
+
+    // ---------------- creators (any signed-in user) ----------------
+    if (path === "/api/editor/code" || path.startsWith("/api/my/")) {
+      if (!signedIn) return json({ error: "Sign in to make levels" }, 401);
+
+      if (m === "GET" && path === "/api/editor/code") {
+        const code = await env.DB.prepare("SELECT value FROM secrets WHERE key = 'editor_code'").first("value");
+        if (!code) return json({ error: "Editor missing" }, 404);
+        return new Response(code, { headers: { "content-type": "text/javascript", "cache-control": "no-store" } });
+      }
+
+      if (m === "GET" && path === "/api/my/levels") {
+        const { results } = await env.DB.prepare("SELECT id, name, view, status, verified_ms, created_at, updated_at FROM levels WHERE user_id = ? ORDER BY updated_at DESC").bind(uid).all();
+        const st = await getStack(env);
+        return json(results.map((r) => {
+          const s = st.byId.get(r.id);
+          return { ...r, archived: !!s?.archived, position: s && !s.archived ? st.ids.indexOf(r.id) + 1 : null, rating: s?.rating ?? null, ratings: s?.ratings || 0, finishes: s?.finishes || 0 };
+        }));
+      }
+
+      if (m === "POST" && path === "/api/my/levels") {
+        const b = await readBody(request);
+        const lvData = normalizeLevel(b.data);
+        const data = JSON.stringify(lvData);
+        const view = lvData.settings.view;
+        if (data.length > 120000) return json({ error: "Level too big — make it smaller" }, 400);
+        const name = String(b.name ?? "").trim().slice(0, 40) || "Untitled";
+        const now = Date.now();
+        if (b.id) {
+          const row = await env.DB.prepare("SELECT user_id, data, status FROM levels WHERE id = ?").bind(+b.id).first();
+          if (!row) return json({ error: "Not found" }, 404);
+          if (row.user_id !== uid && !owner) return json({ error: "Not your level" }, 403);
+          const changed = row.data !== data;
+          // Any change to the map needs a fresh verified win before it is live again.
+          await env.DB.prepare("UPDATE levels SET name = ?, view = ?, data = ?, updated_at = ?, status = ?, verified_ms = CASE WHEN ? THEN NULL ELSE verified_ms END WHERE id = ?")
+            .bind(name, view, data, now, changed ? "draft" : row.status, changed ? 1 : 0, +b.id).run();
+          invalidateStack();
+          return json({ id: +b.id, updated_at: now, status: changed ? "draft" : row.status });
+        }
+        const r = await env.DB.prepare("INSERT INTO levels (user_id, username, name, view, data, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'draft', ?, ?)")
+          .bind(uid, username, name, view, data, now, now).run();
+        return json({ id: r.meta.last_row_id, updated_at: now, status: "draft" });
+      }
+
+      if (m === "DELETE" && (mm = path.match(/^\/api\/my\/levels\/(\d+)$/))) {
+        const row = await env.DB.prepare("SELECT user_id FROM levels WHERE id = ?").bind(+mm[1]).first();
+        if (!row) return json({ error: "Not found" }, 404);
+        if (row.user_id !== uid && !owner) return json({ error: "Not your level" }, 403);
+        await deleteLevel(env, +mm[1]);
+        return json({ ok: true });
+      }
     }
 
     // ---------------- owner-only ----------------
@@ -335,46 +480,40 @@ export default {
       }
 
       if (m === "GET" && path === "/api/admin/levels") {
-        const { results } = await env.DB.prepare("SELECT id, num, name, data, published, updated_at FROM levels ORDER BY num, id").all();
-        return json(results.map((r) => ({ ...r, data: normalizeLevel(JSON.parse(r.data)) })));
+        const { results } = await env.DB.prepare("SELECT id, user_id, username, name, view, status, perm_keep, verified_ms, created_at, updated_at FROM levels ORDER BY updated_at DESC LIMIT 2000").all();
+        const st = await getStack(env);
+        return json(results.map((r) => {
+          const s = st.byId.get(r.id);
+          return { ...r, archived: !!s?.archived, position: s && !s.archived ? st.ids.indexOf(r.id) + 1 : null, rating: s?.rating ?? null, ratings: s?.ratings || 0, ones: s?.ones || 0, avgMs: s?.avgMs ?? null, finishes: s?.finishes || 0 };
+        }));
       }
 
-      if (m === "POST" && path === "/api/admin/levels") {
-        const b = await readBody(request);
-        const data = JSON.stringify(normalizeLevel(b.data));
-        const name = String(b.name ?? "").trim().slice(0, 60) || "Untitled";
-        const pub = b.published ? 1 : 0;
-        const now = Date.now();
-        if (b.id) {
-          const r = await env.DB.prepare("UPDATE levels SET name = ?, data = ?, published = ?, updated_at = ? WHERE id = ?")
-            .bind(name, data, pub, now, +b.id).run();
-          if (!r.meta.changes) return json({ error: "Not found" }, 404);
-          return json({ id: +b.id, updated_at: now });
-        }
-        const r = await env.DB.prepare("INSERT INTO levels (num, name, data, published, updated_at) VALUES ((SELECT COALESCE(MAX(num), 0) + 1 FROM levels), ?, ?, ?, ?)")
-          .bind(name, data, pub, now).run();
-        return json({ id: r.meta.last_row_id, updated_at: now });
-      }
-
-      if (m === "DELETE" && (mm = path.match(/^\/api\/admin\/levels\/(\d+)$/))) {
-        await env.DB.prepare("DELETE FROM levels WHERE id = ?").bind(+mm[1]).run();
+      if (m === "POST" && (mm = path.match(/^\/api\/admin\/levels\/(\d+)\/keep$/))) {
+        const { keep } = await readBody(request);
+        await env.DB.prepare("UPDATE levels SET perm_keep = ? WHERE id = ?").bind(keep ? 1 : 0, +mm[1]).run();
+        invalidateStack();
         return json({ ok: true });
       }
 
-      if (m === "POST" && path === "/api/admin/levels/reorder") {
-        const { ids } = await readBody(request);
-        if (!Array.isArray(ids) || ids.length > 60) return json({ error: "Bad ids" }, 400);
-        await env.DB.batch(ids.map((id, i) => env.DB.prepare("UPDATE levels SET num = ? WHERE id = ?").bind(i + 1, +id)));
+      if (m === "POST" && (mm = path.match(/^\/api\/admin\/levels\/(\d+)\/unpublish$/))) {
+        await env.DB.prepare("UPDATE levels SET status = 'draft' WHERE id = ?").bind(+mm[1]).run();
+        invalidateStack();
+        return json({ ok: true });
+      }
+
+      if (m === "DELETE" && (mm = path.match(/^\/api\/admin\/levels\/(\d+)$/))) {
+        await deleteLevel(env, +mm[1]);
         return json({ ok: true });
       }
 
       if (m === "GET" && path === "/api/admin/players") {
         const [prog, runs, levels] = await env.DB.batch([
-          env.DB.prepare("SELECT * FROM progress ORDER BY updated_at DESC LIMIT 2000"),
+          env.DB.prepare("SELECT * FROM progress ORDER BY updated_at DESC LIMIT 3000"),
           env.DB.prepare("SELECT * FROM runs ORDER BY created_at DESC LIMIT 300"),
-          env.DB.prepare("SELECT id, num, name FROM levels ORDER BY num, id"),
+          env.DB.prepare("SELECT id, name, username FROM levels"),
         ]);
-        return json({ progress: prog.results, runs: runs.results, levels: levels.results });
+        const st = await getStack(env);
+        return json({ progress: prog.results, runs: runs.results, levels: levels.results, order: st.ids });
       }
 
       if (m === "PATCH" && path === "/api/admin/progress") {
@@ -386,25 +525,23 @@ export default {
       }
 
       if (m === "DELETE" && path === "/api/admin/progress") {
-        const uid = url.searchParams.get("user_id");
+        const u = url.searchParams.get("user_id");
         const lid = url.searchParams.get("level_id");
-        if (!uid) return json({ error: "user_id required" }, 400);
-        if (lid) {
-          await env.DB.batch([
-            env.DB.prepare("DELETE FROM progress WHERE user_id = ? AND level_id = ?").bind(uid, +lid),
-            env.DB.prepare("DELETE FROM runs WHERE user_id = ? AND level_id = ?").bind(uid, +lid),
-          ]);
-        } else {
-          await env.DB.batch([
-            env.DB.prepare("DELETE FROM progress WHERE user_id = ?").bind(uid),
-            env.DB.prepare("DELETE FROM runs WHERE user_id = ?").bind(uid),
-          ]);
-        }
+        if (!u) return json({ error: "user_id required" }, 400);
+        const where = lid ? " AND level_id = ?" : "";
+        const bind = lid ? [u, +lid] : [u];
+        await env.DB.batch([
+          env.DB.prepare("DELETE FROM progress WHERE user_id = ?" + where).bind(...bind),
+          env.DB.prepare("DELETE FROM runs WHERE user_id = ?" + where).bind(...bind),
+          env.DB.prepare("DELETE FROM ratings WHERE user_id = ?" + where).bind(...bind),
+        ]);
+        invalidateStack();
         return json({ ok: true });
       }
 
       if (m === "DELETE" && (mm = path.match(/^\/api\/admin\/runs\/(\d+)$/))) {
         await env.DB.prepare("DELETE FROM runs WHERE id = ?").bind(+mm[1]).run();
+        invalidateStack();
         return json({ ok: true });
       }
     }
@@ -419,33 +556,32 @@ export default {
 const players = new Map(); // conn.id -> player record
 const conns = new Map();
 const memProgress = new Map(); // anonymous userId -> { [levelId]: {best, completions} }
-let order = { at: 0, list: [] };
-const levelCache = new Map(); // id -> { at, lv, minMs, portals }
+const levelCache = new Map(); // id -> entry
 
-async function getOrder(env) {
-  if (Date.now() - order.at > 4000) {
-    const { results } = await env.DB.prepare("SELECT id FROM levels WHERE published = 1 ORDER BY num, id").all();
-    order = { at: Date.now(), list: results.map((r) => r.id) };
-  }
-  return order.list;
-}
-
-async function getLevel(env, id) {
-  const c = levelCache.get(id);
-  if (c && Date.now() - c.at < 4000) return c;
-  const row = await env.DB.prepare("SELECT data FROM levels WHERE id = ? AND published = 1").bind(id).first();
-  if (!row) { levelCache.delete(id); return null; }
+function levelEntry(row) {
   const lv = normalizeLevel(JSON.parse(row.data));
-  const entry = {
-    at: Date.now(), lv,
+  return {
+    lv, updated_at: row.updated_at, author_id: row.user_id,
     minMs: (goalDistance(lv) / (lv.settings.speed * 1.12)) * 1000,
     portals: lv.rows.some((r) => /[ud]/.test(r)),
     top: lv.settings.view === "top",
     coins: coinList(lv),
+    hasGoal: lv.rows.some((r) => r.includes("G")),
   };
-  levelCache.set(id, entry);
-  return entry;
 }
+
+async function getLevel(env, id, updatedAt) {
+  const c = levelCache.get(id);
+  if (c && c.updated_at === updatedAt) return c;
+  const row = await env.DB.prepare("SELECT user_id, data, updated_at FROM levels WHERE id = ?").bind(id).first();
+  if (!row) return null;
+  const e = levelEntry(row);
+  levelCache.set(id, e);
+  return e;
+}
+
+const unlockStmt = (env, me, id) =>
+  env.DB.prepare("INSERT OR IGNORE INTO progress (user_id, username, level_id, completions, updated_at) VALUES (?, ?, ?, 0, ?)").bind(me.uid, me.username, id, Date.now());
 
 function nearGround(lv, x, y) {
   for (let cy = Math.floor(y); cy <= Math.floor(y + 1.1); cy++)
@@ -489,7 +625,7 @@ export const room = {
     const me = {
       id: conn.id, uid: conn.userId, username: conn.username || null,
       identity: conn.identity, owner: !!conn.isOwner,
-      level: null, rid: 0, run: null, x: 0, y: 0, dirty: false, unlocked: new Set(),
+      level: null, rid: 0, run: null, x: 0, y: 0, dirty: false,
     };
     players.set(conn.id, me);
     conns.set(conn.id, conn);
@@ -499,6 +635,7 @@ export const room = {
       for (const r of results) progress[r.level_id] = { best: r.best_ms, completions: r.completions };
     } else if (conn.userId) {
       progress = memProgress.get(conn.userId) || {};
+      memProgress.set(conn.userId, progress);
     }
     me.progress = progress;
     conn.send({
@@ -516,26 +653,41 @@ export const room = {
     const now = Date.now();
 
     if (msg.type === "spawn") {
-      const id = +msg.level, rid = +msg.rid;
+      const id = +msg.level, rid = +msg.rid, verify = !!msg.verify;
       me.run = null; me.rid = rid;
-      const list = await getOrder(env);
-      const idx = list.indexOf(id);
-      if (idx < 0) return conn.send({ type: "reject", rid, reason: "Level unavailable" });
-      if (idx > 0 && !me.owner && !me.unlocked.has(id)) {
-        const prev = list[idx - 1];
-        let ok = !!me.progress[prev];
-        if (me.identity === "user") {
-          ok = !!(await env.DB.prepare("SELECT 1 AS ok FROM progress WHERE user_id = ? AND level_id = ? AND completions > 0").bind(me.uid, prev).first("ok"));
+      const reject = (reason) => conn.send({ type: "reject", rid, reason });
+      let L;
+      if (verify) {
+        // Publishing run: the author must beat their own level under full validation.
+        if (me.identity !== "user") return reject("Sign in to publish");
+        const row = await env.DB.prepare("SELECT user_id, data, updated_at FROM levels WHERE id = ?").bind(id).first();
+        if (!row || (row.user_id !== me.uid && !me.owner)) return reject("Not your level");
+        L = levelEntry(row);
+        if (!L.hasGoal) return reject("Add a goal tile first");
+      } else {
+        const st = await getStack(env);
+        const idx = st.ids.indexOf(id);
+        if (idx < 0) return reject("Level unavailable");
+        const meta = st.live[idx];
+        const prev = st.ids[idx - 1];
+        const open = me.owner || idx === 0 || me.progress[id] || (prev && me.progress[prev]?.completions > 0) || meta.author_id === me.uid;
+        if (!open) return reject("Locked — beat the level before it first");
+        if (!me.progress[id]) {
+          me.progress[id] = { best: null, completions: 0 };
+          if (me.identity === "user") await unlockStmt(env, me, id).run();
         }
-        if (!ok) return conn.send({ type: "reject", rid, reason: "Locked — beat the previous level first" });
-        me.unlocked.add(id);
+        L = await getLevel(env, id, meta.updated_at);
+        if (!L) return reject("Level unavailable");
       }
-      const L = await getLevel(env, id);
-      if (!L || me.rid !== rid) return;
+      if (me.rid !== rid) return;
       const p = makePlayer(L.lv);
-      me.level = id; me.x = p.x; me.y = p.y; me.dirty = true;
-      me.run = { start: Date.now(), lv: L.lv, minMs: L.minMs, portals: L.portals, top: L.top, coinsAll: L.coins, coins: new Set(), lx: p.x, ly: p.y, lt: Date.now() - 300, base: p.y, strikes: 0 };
-      if (me.levelAnnounced !== id) { me.levelAnnounced = id; room.broadcast({ type: "lvl", id: me.id, level: id }); }
+      me.level = verify ? null : id; me.x = p.x; me.y = p.y; me.dirty = !verify;
+      me.run = {
+        verify, levelId: id, updatedAt: L.updated_at, authorId: L.author_id,
+        start: Date.now(), lv: L.lv, minMs: L.minMs, portals: L.portals, top: L.top,
+        coinsAll: L.coins, coins: new Set(), lx: p.x, ly: p.y, lt: Date.now() - 300, base: p.y, strikes: 0,
+      };
+      if (!verify && me.levelAnnounced !== id) { me.levelAnnounced = id; room.broadcast({ type: "lvl", id: me.id, level: id }); }
       conn.send({ type: "spawned", rid, now: Date.now() });
       return;
     }
@@ -545,26 +697,38 @@ export const room = {
       const r = checkSample(me, +msg.x, +msg.y, +msg.t, now);
       if (r === "dead") return kill(me, "hit");
       if (r === "bad" && ++me.run.strikes >= 3) return kill(me, "desync");
-      me.x = me.run.lx; me.y = me.run.ly; me.dirty = true;
+      if (!me.run.verify) { me.x = me.run.lx; me.y = me.run.ly; me.dirty = true; }
       if (msg.type === "pos") return;
 
       // finish claim
       const run = me.run, lv = run.lv;
       me.run = null;
       let onGoal = false;
-      for (let cy = Math.floor(me.y - 1); cy <= Math.floor(me.y + 1); cy++)
-        for (let cx = Math.floor(me.x - 1); cx <= Math.floor(me.x + 1); cx++)
-          if (tileAt(lv, cx, cy) === "G" && Math.abs(me.x - (cx + 0.5)) < 1.05 && Math.abs(me.y - (cy + 0.5)) < 1.05) onGoal = true;
+      for (let cy = Math.floor(run.ly - 1); cy <= Math.floor(run.ly + 1); cy++)
+        for (let cx = Math.floor(run.lx - 1); cx <= Math.floor(run.lx + 1); cx++)
+          if (tileAt(lv, cx, cy) === "G" && Math.abs(run.lx - (cx + 0.5)) < 1.05 && Math.abs(run.ly - (cy + 0.5)) < 1.05) onGoal = true;
       const elapsed = now - run.start;
-      if (!onGoal) return conn.send({ type: "reject", rid: me.rid, reason: "Finish not verified" });
-      if (run.coins.size < run.coinsAll.length) return conn.send({ type: "reject", rid: me.rid, reason: "Missing coins" });
-      if (elapsed < run.minMs || r === "bad" && run.strikes >= 2) return conn.send({ type: "reject", rid: me.rid, reason: "Run rejected" });
+      const rid = me.rid;
+      if (!onGoal) return conn.send({ type: "reject", rid, reason: "Finish not verified" });
+      if (run.coins.size < run.coinsAll.length) return conn.send({ type: "reject", rid, reason: "Missing coins" });
+      if (elapsed < run.minMs || run.strikes >= 2) return conn.send({ type: "reject", rid, reason: "Run rejected" });
 
-      const levelId = me.level;
+      if (run.verify) {
+        const u = await env.DB.prepare("UPDATE levels SET status = 'published', verified_ms = ? WHERE id = ? AND updated_at = ?")
+          .bind(elapsed, run.levelId, run.updatedAt).run();
+        if (!u.meta.changes) return conn.send({ type: "reject", rid, reason: "Level changed during the run — save & verify again" });
+        invalidateStack();
+        return conn.send({ type: "verified", rid, level: run.levelId, time: elapsed });
+      }
+
+      const levelId = run.levelId;
+      const st = await getStack(env);
+      const next = st.ids[st.ids.indexOf(levelId) + 1] || null;
+      const unlockNext = next && !me.progress[next];
       const prev = me.progress[levelId] || { best: null, completions: 0 };
       let result = { best: prev.best == null ? elapsed : Math.min(prev.best, elapsed), completions: prev.completions + 1 };
       if (me.identity === "user") {
-        const [, , row] = await env.DB.batch([
+        const stmts = [
           env.DB.prepare("INSERT INTO runs (user_id, username, level_id, time_ms, created_at) VALUES (?, ?, ?, ?, ?)").bind(me.uid, me.username, levelId, elapsed, now),
           env.DB.prepare(
             "INSERT INTO progress (user_id, username, level_id, completions, best_ms, last_ms, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?) " +
@@ -573,17 +737,18 @@ export const room = {
             "last_ms = excluded.last_ms, username = excluded.username, updated_at = excluded.updated_at"
           ).bind(me.uid, me.username, levelId, elapsed, elapsed, now),
           env.DB.prepare("SELECT completions, best_ms FROM progress WHERE user_id = ? AND level_id = ?").bind(me.uid, levelId),
-        ]);
-        const got = row.results[0];
+        ];
+        if (unlockNext) stmts.push(unlockStmt(env, me, next));
+        const res = await env.DB.batch(stmts);
+        const got = res[2].results[0];
         if (got) result = { best: got.best_ms, completions: got.completions };
-      } else if (me.uid) {
-        memProgress.set(me.uid, me.progress);
       }
       me.progress[levelId] = result;
-      const list = await getOrder(env);
-      const next = list[list.indexOf(levelId) + 1];
-      if (next) me.unlocked.add(next);
-      conn.send({ type: "result", rid: me.rid, level: levelId, time: elapsed, best: result.best, completions: result.completions, next: next || null, saved: me.identity === "user" });
+      if (unlockNext) me.progress[next] = { best: null, completions: 0 };
+      conn.send({
+        type: "result", rid, level: levelId, time: elapsed, best: result.best, completions: result.completions,
+        next, saved: me.identity === "user", canRate: me.identity === "user" && run.authorId !== me.uid,
+      });
     }
   },
 
