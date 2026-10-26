@@ -25,6 +25,7 @@ html, body {
 }
 #hud > * { pointer-events: auto; }
 .hud-left, .hud-right { position: relative; display: flex; gap: 6px; align-items: center; min-width: 80px; }
+.hud-left { flex-direction: column; align-items: flex-start; }
 .hud-right { justify-content: flex-end; }
 
 .chip {
@@ -42,7 +43,6 @@ button.chip:hover { background: rgba(255, 138, 31, 0.9); }
 .hud-mid { display: flex; gap: 6px; }
 #coins { color: #ffd23f; min-width: 0; }
 .mono { font-variant-numeric: tabular-nums; cursor: default; min-width: 70px; text-align: center; }
-#online { cursor: default; opacity: 0.75; }
 
 #center {
   position: fixed;
@@ -270,5 +270,105 @@ button.chip:hover { background: rgba(255, 138, 31, 0.9); }
 .d-grid span { font-size: 11px; opacity: 0.65; }
 .d-actions { margin-top: 14px; display: flex; justify-content: center; }
 .d-actions .chip { font-size: 16px; padding: 10px 22px; }
+
+/* ---------- who's online ---------- */
+.people { display: flex; align-items: center; padding-left: 4px; }
+.people a, .people .more {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  margin-left: -8px;
+  border: 2px solid #fff;
+  background: #ff8a1f;
+  overflow: hidden;
+  flex: none;
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.4);
+  transition: transform 0.12s;
+}
+.people a:hover { transform: translateY(-2px) scale(1.08); z-index: 1; }
+.people a.me { border-color: #4ff0ff; }
+.people a.guest { background: #6b6290; }
+.people img { width: 100%; height: 100%; display: block; }
+.people .more {
+  display: grid;
+  place-items: center;
+  background: #050507;
+  color: #fff;
+  font: 700 11px system-ui, sans-serif;
+}
+.map-top .people { margin-right: 4px; }
+
+/* ---------- chat ---------- */
+#chatBtn {
+  position: fixed;
+  right: calc(14px + env(safe-area-inset-right));
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  background: rgba(5, 5, 7, 0.8);
+  font-size: 22px;
+  cursor: pointer;
+  z-index: 70;
+  box-shadow: 0 4px 0 rgba(0, 0, 0, 0.4);
+}
+#chatBtn.on, #chatBtn:hover { background: #ff8a1f; }
+#chatBadge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 10px;
+  background: #ff3b5c;
+  color: #fff;
+  font: 700 11px/20px system-ui, sans-serif;
+}
+#chat {
+  position: fixed;
+  right: calc(14px + env(safe-area-inset-right));
+  bottom: calc(74px + env(safe-area-inset-bottom));
+  width: min(92vw, 340px);
+  height: min(60vh, 460px);
+  display: flex;
+  flex-direction: column;
+  background: rgba(10, 9, 20, 0.94);
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  border-radius: 14px;
+  z-index: 70;
+  overflow: hidden;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  user-select: text;
+  -webkit-user-select: text;
+}
+.chat-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 8px 8px 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.12); }
+.chat-head .chip { padding: 4px 9px; }
+#chatList { flex: 1; overflow-y: auto; padding: 8px 10px; display: flex; flex-direction: column; gap: 8px; touch-action: pan-y; }
+.cmsg { display: flex; gap: 8px; position: relative; }
+.cav img { width: 28px; height: 28px; border-radius: 50%; border: 1.5px solid #fff; display: block; }
+.cmsg.mine .cav img { border-color: #4ff0ff; }
+.cbody { min-width: 0; flex: 1; }
+.chd { display: flex; gap: 6px; align-items: baseline; font-size: 12px; }
+.chd a { color: #ff8a1f; font-weight: 700; text-decoration: none; }
+.chd span { opacity: 0.45; font-size: 11px; }
+.ctx { font-size: 14px; line-height: 1.35; overflow-wrap: anywhere; }
+.cdel { position: absolute; right: 0; top: 0; background: none; border: 0; color: #ff3b5c; font-size: 16px; cursor: pointer; opacity: 0; }
+.cmsg:hover .cdel { opacity: 1; }
+.cempty { margin: auto; opacity: 0.5; font-size: 13px; }
+#chatNote { padding: 4px 12px; font-size: 12px; color: #ff9db0; }
+#chatForm { display: flex; gap: 6px; padding: 8px; border-top: 1px solid rgba(255, 255, 255, 0.12); }
+#chatInput {
+  flex: 1;
+  min-width: 0;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 8px;
+  color: #fff;
+  padding: 8px 10px;
+  font: 14px system-ui, sans-serif;
+}
+#chatInput:focus { outline: none; border-color: #ff8a1f; }
 
 [hidden] { display: none !important; }

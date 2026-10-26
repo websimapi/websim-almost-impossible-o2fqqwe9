@@ -46,6 +46,7 @@ export function createMap(ctx) {
     const top = el("div", "map-top");
     top.append(el("div", "map-stats",
       `<b>Level map</b><span class="st beaten">★ ${nBeaten} beaten</span><span class="st open">● ${nOpen} unlocked</span><span class="st">${S.levels.length} levels</span>`));
+    top.append(ctx.people());
     if (ci >= 0) {
       const c = el("button", "chip pri", `Continue ▶ #${ci + 1}`);
       c.onclick = () => ctx.play(S.levels[ci].id);

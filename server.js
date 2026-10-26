@@ -339,6 +339,8 @@ export const schema = `
   CREATE INDEX IF NOT EXISTS runs_user ON runs (user_id);
   CREATE INDEX IF NOT EXISTS runs_level ON runs (level_id);
   CREATE INDEX IF NOT EXISTS runs_created ON runs (created_at);
+  CREATE TABLE IF NOT EXISTS chat (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, username TEXT, text TEXT NOT NULL, created_at INTEGER NOT NULL);
+  CREATE INDEX IF NOT EXISTS chat_created ON chat (created_at);
 `;
 
 const json = (d, status = 200) => Response.json(d, { status, headers: { "cache-control": "no-store" } });
@@ -557,6 +559,16 @@ const players = new Map(); // conn.id -> player record
 const conns = new Map();
 const memProgress = new Map(); // anonymous userId -> { [levelId]: {best, completions} }
 const levelCache = new Map(); // id -> entry
+const CHAT_KEEP = 60;
+let chatLog = null; // recent messages, loaded once per room lifetime
+
+async function getChat(env) {
+  if (!chatLog) {
+    const { results } = await env.DB.prepare("SELECT id, username, text, created_at FROM chat ORDER BY id DESC LIMIT ?").bind(CHAT_KEEP).all();
+    chatLog = results.reverse().map((r) => ({ id: r.id, username: r.username, text: r.text, t: r.created_at }));
+  }
+  return chatLog;
+}
 
 function levelEntry(row) {
   const lv = normalizeLevel(JSON.parse(row.data));
@@ -638,8 +650,9 @@ export const room = {
       memProgress.set(conn.userId, progress);
     }
     me.progress = progress;
+    const chat = await getChat(env);
     conn.send({
-      type: "welcome", id: conn.id, now: Date.now(), progress,
+      type: "welcome", id: conn.id, now: Date.now(), progress, chat,
       players: [...players.values()].filter((p) => p.id !== conn.id).map((p) => ({ id: p.id, username: p.username, level: p.level })),
     });
     room.broadcast({ type: "join", player: { id: me.id, username: me.username, level: null } }, { except: [conn.id] });
@@ -651,6 +664,31 @@ export const room = {
     let msg;
     try { msg = JSON.parse(message); } catch { return; }
     const now = Date.now();
+
+    if (msg.type === "chat") {
+      if (me.identity !== "user") return conn.send({ type: "chatError", reason: "Sign in to chat" });
+      if (now - (me.lastChat || 0) < 700) return conn.send({ type: "chatError", reason: "Slow down" });
+      const text = room.censor(String(msg.text ?? "")).replace(/\s+/g, " ").trim().slice(0, 200);
+      if (!text) return;
+      me.lastChat = now;
+      const r = await env.DB.prepare("INSERT INTO chat (user_id, username, text, created_at) VALUES (?, ?, ?, ?)").bind(me.uid, me.username, text, now).run();
+      const m = { id: r.meta.last_row_id, username: me.username, text, t: now };
+      const log = await getChat(env);
+      if (!log.some((x) => x.id === m.id)) { log.push(m); if (log.length > CHAT_KEEP) log.shift(); }
+      room.broadcast({ type: "chat", msg: m });
+      return;
+    }
+
+    if (msg.type === "chatDelete") {
+      if (!me.owner) return;
+      const id = +msg.id;
+      await env.DB.prepare("DELETE FROM chat WHERE id = ?").bind(id).run();
+      const log = await getChat(env);
+      const i = log.findIndex((x) => x.id === id);
+      if (i >= 0) log.splice(i, 1);
+      room.broadcast({ type: "chatDel", id });
+      return;
+    }
 
     if (msg.type === "spawn") {
       const id = +msg.level, rid = +msg.rid, verify = !!msg.verify;

@@ -1,6 +1,7 @@
 import * as shared from "./server.js";
 import * as render from "./render.js";
 import { createMap } from "./map.js";
+import { createChat } from "./chat.js";
 
 const { normalizeLevel, makePlayer, step, coinList } = shared;
 const { drawWorld, drawPlayer, mixHex } = render;
@@ -120,10 +121,45 @@ function showAttempt() {
   requestAnimationFrame(() => setTimeout(() => attemptEl.classList.remove("show"), 700));
 }
 
+// Who's here right now: one circle per distinct player, you first.
+function peopleRow() {
+  const row = document.createElement("div");
+  row.className = "people";
+  const seen = new Set();
+  const list = [];
+  const meName = S.me?.username;
+  if (meName) { seen.add(meName); list.push({ username: meName, me: true }); }
+  let guests = meName ? 0 : 1;
+  for (const o of S.others.values()) {
+    if (!o.username) { guests++; continue; }
+    if (seen.has(o.username)) continue;
+    seen.add(o.username);
+    list.push({ username: o.username });
+  }
+  const MAX = 8;
+  for (const p of list.slice(0, MAX)) {
+    const a = document.createElement("a");
+    a.href = `https://websim.com/@${encodeURIComponent(p.username)}`;
+    a.target = "_blank";
+    a.title = "@" + p.username + (p.me ? " (you)" : "");
+    if (p.me) a.className = "me";
+    a.innerHTML = `<img src="https://images.websim.com/avatar/${encodeURIComponent(p.username)}" alt="">`;
+    row.append(a);
+  }
+  const extra = Math.max(0, list.length - MAX) + guests;
+  if (extra) {
+    const m = document.createElement("span");
+    m.className = "more";
+    m.textContent = "+" + extra;
+    m.title = `${extra} more${guests ? ` (${guests} guest${guests > 1 ? "s" : ""})` : ""}`;
+    row.append(m);
+  }
+  row.title = `${list.length + guests} online`;
+  return row;
+}
 function updateOnline() {
-  const n = S.others.size + 1;
-  $("online").hidden = n < 2;
-  $("online").textContent = `● ${n} online`;
+  $("people").replaceWith(Object.assign(peopleRow(), { id: "people" }));
+  map.refresh();
 }
 
 // ---------------------------------------------------------------- progression
@@ -343,6 +379,7 @@ addEventListener("keydown", (e) => {
 // ---------------------------------------------------------------- map
 const map = createMap({
   get S() { return S; },
+  people: peopleRow,
   levelState, isOpen, continueIndex, starPicker, rate, fmt, esc,
   play: (id) => { closeMap(); loadLevel(id); },
 });
@@ -359,12 +396,19 @@ function onMessage(ev) {
     S.myId = m.id;
     S.offset = m.now - Date.now();
     mergeProgress(m.progress);
+    chat.setHistory(m.chat);
     S.others.clear();
     for (const p of m.players) S.others.set(p.id, { ...p, x: 0, y: 0, tx: 0, ty: 0, seen: false });
     updateOnline();
     updateLevelUI();
     if (S.mode === "loading") pickStartLevel();
     else if (S.lv && (S.mode === "play" || S.mode === "dead")) respawn();
+  } else if (m.type === "chat") {
+    chat.add(m.msg);
+  } else if (m.type === "chatDel") {
+    chat.remove(m.id);
+  } else if (m.type === "chatError") {
+    chat.error(m.reason);
   } else if (m.type === "join") {
     S.others.set(m.player.id, { ...m.player, x: 0, y: 0, tx: 0, ty: 0, seen: false });
     updateOnline();
@@ -411,6 +455,8 @@ function onMessage(ev) {
     refreshLevels();
   }
 }
+
+const chat = createChat({ send: (m) => send(m), getMe: () => S.me, esc });
 
 function send(msg) {
   try { S.room?.send(msg); } catch {}
@@ -608,6 +654,8 @@ function draw(dt) {
   try { S.me = await (await fetch("/api/me")).json(); } catch { S.me = {}; }
   $("adminBtn").hidden = !S.me.isOwner;
   $("createBtn").hidden = !S.me.signedIn;
+  chat.refreshMe();
+  updateOnline();
   await refreshLevels();
   // don't make players stare at an empty screen if the room is slow to welcome us
   setTimeout(() => { if (S.mode === "loading") pickStartLevel(); }, 2500);
